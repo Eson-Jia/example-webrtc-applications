@@ -136,24 +136,24 @@ func handleNewConnection(offer *webrtc.SessionDescription) *webrtc.SessionDescri
 	}
 
 	// Handle RTCP, see rtcpReader for why
-	rtpSender, err := peerConnection.AddTrack(audioTrack)
+	rtpAudioSender, err := peerConnection.AddTrack(audioTrack)
 	if err != nil {
 		panic(err)
 	}
-	rtcpReader(rtpSender)
+	rtcpReader(rtpAudioSender)
 
 	// Create a Video Track
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", "pion")
 	if err != nil {
 		panic(err)
 	}
 
 	// Handle RTCP, see rtcpReader for why
-	rtpSender, err = peerConnection.AddTrack(videoTrack)
+	rtpVideoSender, err := peerConnection.AddTrack(videoTrack)
 	if err != nil {
 		panic(err)
 	}
-	rtcpReader(rtpSender)
+	rtcpReader(rtpVideoSender)
 
 	// 生成唯一连接 ID，并存储连接
 	mu.Lock()
@@ -165,29 +165,23 @@ func handleNewConnection(offer *webrtc.SessionDescription) *webrtc.SessionDescri
 	// 当收到远程 Track 时，创建本地 Track 并转发给其他所有连接
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		fmt.Printf("收到来自 %s 的远程流: %s\n", connID, track.Kind().String())
-
-		localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
-		if err != nil {
-			fmt.Println("创建本地 Track 失败:", err)
-			return
+		var sender *webrtc.RTPSender
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			sender = rtpAudioSender
+		} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+			sender = rtpVideoSender
 		}
-
 		// 将本地 Track 添加到所有其他连接
 		mu.Lock()
 		for id, pc := range peerConnections {
 			if id == connID {
 				continue
 			}
-			rtpSender, err := pc.AddTrack(localTrack)
-			if err != nil {
-				fmt.Printf("在连接 %s 添加 Track 失败: %v\n", id, err)
-				continue
-			}
 			// 持续读取 RTCP 数据包
 			go func() {
 				rtcpBuf := make([]byte, 1500)
 				for {
-					if _, _, err := rtpSender.Read(rtcpBuf); err != nil {
+					if _, _, err := sender.Read(rtcpBuf); err != nil {
 						return
 					}
 				}
@@ -202,8 +196,16 @@ func handleNewConnection(offer *webrtc.SessionDescription) *webrtc.SessionDescri
 				if err != nil {
 					return
 				}
-				if err := localTrack.WriteRTP(rtpPacket); err != nil {
-					return
+				//send to other connections
+				mu.Lock()
+				for id, pc := range peerConnections {
+					if id == connID {
+						continue
+					}
+					_, err = pc.WriteRTP(rtpPacket)
+					if err != nil {
+						fmt.Println("failed to write rtp packet")
+					}
 				}
 			}
 		}()
