@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -38,24 +41,58 @@ func main() {
 }
 
 func startSFU() {
-	// 使用 bufio 读取整行输入
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Println("\n等待新的 SDP (请输入 Base64 编码的 SDP):")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("读取输入失败:", err)
-			continue
-		}
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
+	//first read from 1.sdp
+	sdp1, err := os.OpenFile("1.sdp", os.O_RDONLY, 0666)
+	if err != nil {
+		fmt.Println("failed to open 1.sdp")
+		return
+	}
+	defer sdp1.Close()
+	reader := bufio.NewReader(sdp1)
+	content, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Println("failed to read 1.sdp")
+		return
+	}
+	inputStr := strings.TrimSpace(content)
+	if inputStr == "" {
+		fmt.Println("failed to read input")
+		return
+	}
+	offer := webrtc.SessionDescription{}
+	if err := decode(inputStr, &offer); err != nil {
+		fmt.Println("SDP 解码失败:", err)
+		return
+	}
 
+	// 处理新的 WebRTC 连接
+	answer := handleNewConnection(&offer)
+	fmt.Println("返回的 SDP Answer (Base64 编码):")
+	fmt.Println(encode(answer))
+	time.Sleep(time.Second * 10)
+	{
+		//read from 2.sdp
+		sdp2, err := os.OpenFile("2.sdp", os.O_RDONLY, 0666)
+		if err != nil {
+			fmt.Println("failed to open 2.sdp")
+			return
+		}
+		defer sdp2.Close()
+		reader := bufio.NewReader(sdp2)
+		content, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			fmt.Println("failed to read 2.sdp")
+			return
+		}
+		inputStr := strings.TrimSpace(content)
+		if inputStr == "" {
+			fmt.Println("failed to read input")
+			return
+		}
 		offer := webrtc.SessionDescription{}
-		if err := decode(input, &offer); err != nil {
+		if err := decode(inputStr, &offer); err != nil {
 			fmt.Println("SDP 解码失败:", err)
-			continue
+			return
 		}
 
 		// 处理新的 WebRTC 连接
@@ -63,6 +100,22 @@ func startSFU() {
 		fmt.Println("返回的 SDP Answer (Base64 编码):")
 		fmt.Println(encode(answer))
 	}
+
+	select {}
+}
+
+// Read incoming RTCP packets
+// Before these packets are returned they are processed by interceptors. For things
+// like NACK this needs to be called.
+func rtcpReader(rtpSender *webrtc.RTPSender) {
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 }
 
 func handleNewConnection(offer *webrtc.SessionDescription) *webrtc.SessionDescription {
@@ -76,6 +129,31 @@ func handleNewConnection(offer *webrtc.SessionDescription) *webrtc.SessionDescri
 	if err != nil {
 		panic(err)
 	}
+
+	audioTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion")
+	if err != nil {
+		panic(err)
+	}
+
+	// Handle RTCP, see rtcpReader for why
+	rtpSender, err := peerConnection.AddTrack(audioTrack)
+	if err != nil {
+		panic(err)
+	}
+	rtcpReader(rtpSender)
+
+	// Create a Video Track
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
+	if err != nil {
+		panic(err)
+	}
+
+	// Handle RTCP, see rtcpReader for why
+	rtpSender, err = peerConnection.AddTrack(videoTrack)
+	if err != nil {
+		panic(err)
+	}
+	rtcpReader(rtpSender)
 
 	// 生成唯一连接 ID，并存储连接
 	mu.Lock()
@@ -172,9 +250,14 @@ func encode(obj *webrtc.SessionDescription) string {
 
 // decode 将 Base64 编码的字符串解码为 SessionDescription
 func decode(in string, obj *webrtc.SessionDescription) error {
+	// 移除所有空白字符（包括换行、回车、空格）
+	in = strings.ReplaceAll(in, "\n", "")
+	in = strings.ReplaceAll(in, "\r", "")
+	in = strings.ReplaceAll(in, " ", "")
+	in = strings.TrimSpace(in)
 	b, err := base64.StdEncoding.DecodeString(in)
 	if err != nil {
-		return err
+		return fmt.Errorf("解码 Base64 失败，请检查 SDP 是否为有效的 Base64 编码: %w", err)
 	}
 	return json.Unmarshal(b, obj)
 }
